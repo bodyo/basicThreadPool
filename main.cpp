@@ -53,7 +53,7 @@ void mergeThread(std::queue<std::map<string, size_t>> &queueToMerge, ThreadHelpe
             mapToMerge[std::move(k)]+=v;
     }
 
-    ofstream outfile ("../newText.txt");
+    ofstream outfile ("textStatistic.txt");
     outfile << "common size: " << mapToMerge.size() << std::endl;
 
     for (const auto &[k, v]: mapToMerge)
@@ -226,7 +226,7 @@ void manager(std::queue<std::vector<string>> &wordsToCount, std::condition_varia
 int main()
 {    
     auto startTime = getCurrentTimeFenced();
-    ifstream file("../text.txt");
+    ifstream file("text.txt");
 
     if (!file)
         return 1;
