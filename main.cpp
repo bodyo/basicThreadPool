@@ -4,79 +4,271 @@
 #include <istream>
 #include <map>
 #include <vector>
-#include <iostream>
 #include <string>
 #include <cstring>
-#include <sstream>
+#include <queue>
 #include <algorithm>
 #include <iterator>
 #include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 using namespace std;
 
-void countWords(std::vector<string>::iterator begin, std::vector<string>::iterator end, map<string, size_t> &mapToMerge, mutex &mux)
+struct ThreadHelper
 {
-    auto wMap = map<string, size_t>();
+    std::mutex dataMutex;
+    std::condition_variable dataCondVar;
+};
 
-    while (begin != end)
-    {
-        auto str = *begin;
-        std::transform(str.begin(), str.end(), str.begin(), ::tolower);
-
-        str.erase(remove_if(str.begin(), str.end(), [](char c)
-        { return !isalpha(c); }), str.end());
-
-        ++wMap[str];
-        ++begin;
-    }
-
-    mux.lock();
-    for (const auto &elem : wMap)
-        mapToMerge[elem.first]+=elem.second;
-    mux.unlock();
+template<class D>
+inline long long to_us(const D& d){
+   return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
 }
 
-int main(int argc, char**argv)
+inline std::chrono::high_resolution_clock::time_point getCurrentTimeFenced(){
+   std::atomic_thread_fence(std::memory_order_seq_cst);
+   auto res_time = std::chrono::high_resolution_clock::now();
+   std::atomic_thread_fence(std::memory_order_seq_cst);
+   return res_time;
+}
+
+void mergeThread(std::queue<std::map<string, size_t>> &queueToMerge, ThreadHelper &helper)
 {
-    ifstream file("../text.txt", std::fstream::in | std::fstream::out);
+    std::map<string, size_t> mapToMerge;
+    while (true)
+    {
+        std::unique_lock<std::mutex> ul(helper.dataMutex);
+        if (queueToMerge.empty())
+            helper.dataCondVar.wait(ul, [&queueToMerge](){return !queueToMerge.empty();});
+
+        if (queueToMerge.front().empty())
+            break;
+
+        auto temp = std::move(queueToMerge.front());
+        queueToMerge.pop();
+        ul.unlock();
+
+        for(const auto &[k, v]: temp)
+            mapToMerge[std::move(k)]+=v;
+    }
+
+    ofstream outfile ("../newText.txt");
+    outfile << "common size: " << mapToMerge.size() << std::endl;
+
+    for (const auto &[k, v]: mapToMerge)
+        outfile << k << " -> " << v << endl;
+    outfile.close();
+}
+
+void worker(std::queue<std::vector<std::string>> *toCount, std::queue<map<string, size_t>> &mapToMerge, ThreadHelper &mergeHelper, ThreadHelper *helper)
+{
+    while(true)
+    {
+        std::unique_lock<std::mutex> ul(helper->dataMutex);
+        if (toCount->empty())
+            helper->dataCondVar.wait(ul, [&toCount](){return !toCount->empty();});
+
+        if (toCount->front().empty())
+            return;
+        auto strings(std::move(toCount->front()));
+        toCount->pop();
+        ul.unlock();
+
+        auto wMap = map<string, size_t>();
+        for (auto &word : strings)
+        {
+            std::transform(word.begin(), word.end(), word.begin(), ::tolower);
+
+            word.erase(remove_if(word.begin(), word.end(), [](char c)
+            { return !isalpha(c); }), word.end());
+
+            ++wMap[std::move(word)];
+        }
+
+        if (wMap.empty())
+            continue;
+        std::lock_guard<std::mutex> gl(mergeHelper.dataMutex);
+        mapToMerge.push(std::move(wMap));
+        mergeHelper.dataCondVar.notify_one();
+    }
+}
+
+void manager(std::queue<std::vector<string>> &wordsToCount, std::condition_variable &dataReadyVar, std::mutex &dataMutex)
+{
+    std::vector<std::pair<std::thread, ThreadHelper*>> threadsPool;
+    long threadsCount = thread::hardware_concurrency();
+    std::vector<std::queue<std::vector<std::string>>*> threadsQueue;
+    std::queue<std::map<string, size_t>> queueToMerge;
+
+    ThreadHelper mergeHelper;
+
+    auto mThread = std::thread(mergeThread, ref(queueToMerge), ref(mergeHelper));
+
+    while (true)
+    {
+        unique_lock<std::mutex> ul(dataMutex);
+        if (wordsToCount.empty())
+            dataReadyVar.wait(ul, [&wordsToCount](){return !wordsToCount.empty();});
+        ul.unlock();
+
+        //creating new threads
+        if (threadsCount)
+        {
+            if (!threadsQueue.empty())
+            {
+                if (auto min = std::min_element(threadsQueue.begin(), threadsQueue.end(),
+                                                [](const std::queue<std::vector<std::string>> *val1, const std::queue<std::vector<std::string>> *val2) {
+                                                return val1->size() < val2->size();});
+                        (min != threadsQueue.end()) && ((*min)->size() == 0))
+                {
+                    if (wordsToCount.front().empty())
+                    {
+                        for (size_t i = 0; i < threadsPool.size(); ++i)
+                        {
+                            threadsPool[i].second->dataMutex.lock();
+                            threadsQueue[i]->push({});
+                            threadsPool[i].second->dataMutex.unlock();
+                            threadsPool[i].second->dataCondVar.notify_one();
+                        }
+                        break;
+                    }
+
+                    ul.lock();
+                    auto words = std::move(wordsToCount.front());
+                    wordsToCount.pop();
+                    ul.unlock();
+
+                    auto helper = threadsPool.at(std::distance(threadsQueue.begin(), min)).second;
+
+                    helper->dataMutex.lock();
+                    (*min)->push(words);
+                    helper->dataMutex.unlock();
+                    helper->dataCondVar.notify_one();
+
+                    continue;
+                }
+            }
+
+            threadsQueue.push_back(new std::queue<std::vector<std::string>>());
+            if (wordsToCount.front().empty())
+            {
+                for (size_t i = 0; i < std::thread::hardware_concurrency(); ++i)
+                {
+                    threadsPool[i].second->dataMutex.lock();
+                    threadsQueue[i]->push({});
+                    threadsPool[i].second->dataMutex.unlock();
+                    threadsPool[i].second->dataCondVar.notify_one();
+                }
+                break;
+            }
+
+            ul.lock();
+            threadsQueue.back()->push(std::move(wordsToCount.front()));
+            ul.unlock();
+
+            auto threadHelper = new ThreadHelper;
+            threadsPool.push_back(std::make_pair(std::thread(worker, threadsQueue.back(), ref(queueToMerge), ref(mergeHelper), threadHelper), threadHelper));
+            threadsCount--;
+            ul.lock();
+            wordsToCount.pop();
+            ul.unlock();
+        }
+        else
+        {
+            if (wordsToCount.front().back().empty())
+            {
+                for (size_t i = 0; i < std::thread::hardware_concurrency(); ++i)
+                {
+                    threadsPool[i].second->dataMutex.lock();
+                    threadsQueue[i]->push({});
+                    threadsPool[i].second->dataMutex.unlock();
+                    threadsPool[i].second->dataCondVar.notify_one();
+                }
+                break;
+            }
+
+            auto minElem = std::min_element(threadsQueue.begin(), threadsQueue.end(),
+                             [](const std::queue<std::vector<std::string>> *val1, const std::queue<std::vector<std::string>> *val2) {
+                return val1->size() > val2->size();
+            });
+            ul.lock();
+            auto words = std::move(wordsToCount.front());
+            wordsToCount.pop();
+            ul.unlock();
+
+            auto helper = threadsPool.at(std::distance(threadsQueue.begin(), minElem)).second;
+
+            helper->dataMutex.lock();
+            (*minElem)->push(words);
+            helper->dataMutex.unlock();
+            helper->dataCondVar.notify_one();
+
+        }
+    }
+
+    for (auto th = threadsPool.begin(); th != threadsPool.end(); ++th)
+        th->first.join();
+
+    for (auto &iter : threadsQueue)
+        delete iter;
+    for (auto &iter : threadsPool)
+        delete iter.second;
+
+    mergeHelper.dataMutex.lock();
+    queueToMerge.push({});
+    mergeHelper.dataCondVar.notify_one();
+    mergeHelper.dataMutex.unlock();
+
+    mThread.join();
+}
+
+int main()
+{    
+    auto startTime = getCurrentTimeFenced();
+    ifstream file("../text.txt");
 
     if (!file)
         return 1;
-    long threadsCount = 10;
-    if (argc > 1)
-        if (strcmp(argv[1], "-j") == 0)
-            threadsCount = atoi(argv[2]);
 
-
+    const int wordsPiece = 26820;
+    std::queue<std::vector<string>> wordsForCount;
+    std::mutex managerMutex;
+    std::condition_variable dataReadyVar;
     vector<string> tokens;
-    copy(istream_iterator<string>(file),
-         istream_iterator<string>(),
-         back_inserter(tokens));
-    file.close();
-
-    int block = static_cast<int>(tokens.size()/threadsCount);
-
-    map<string, size_t> counted;
-    vector<thread> threads;
-    mutex mux;
-
-    std::vector<string>::iterator iter = tokens.begin();
-    for (int i = 0; i < threadsCount; ++i)
+    std::thread dataManager(manager, ref(wordsForCount), ref(dataReadyVar), ref(managerMutex));
     {
-        if (i == threadsCount-1)
-            block+=tokens.end() - (iter+block);
-        threads.push_back(thread(countWords, iter, iter+block, ref(counted), ref(mux)));
-        iter+=block;
+        int wordsCounter = 0;
+        string word;
+        while (file >> word)
+        {
+            wordsCounter++;
+            tokens.push_back(std::move(word));
+            if (!tokens.empty() && tokens.size() >= wordsPiece)
+            {
+                managerMutex.lock();
+                wordsForCount.push(std::move(tokens));
+                managerMutex.unlock();
+                dataReadyVar.notify_one();
+                tokens.clear();
+            }
+        }
+        if (!tokens.empty())
+        {
+            managerMutex.lock();
+            wordsForCount.push(std::move(tokens));
+            managerMutex.unlock();
+            dataReadyVar.notify_one();
+            tokens.clear();
+        }
+        managerMutex.lock();
+        wordsForCount.push({});
+        dataReadyVar.notify_one();
+        managerMutex.unlock();
+        file.close();
     }
 
-    for (auto &th : threads)
-        th.join();
+    dataManager.join();
 
-    ofstream outfile ("../newText1.txt");
-
-    for (auto it = counted.begin(); it != counted.end(); ++it)
-        outfile << it->first << " -> " << it->second << endl;
-    outfile.close();
-
-    return 0;
+    cout << "exec time: " << to_us(getCurrentTimeFenced() - startTime) << endl;
 }
